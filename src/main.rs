@@ -284,14 +284,18 @@ fn find_agent() -> Option<String> {
     if let Ok(path) = std::env::var("AGENT_PATH") {
         if !path.is_empty() && std::path::Path::new(&path).exists() { return Some(path); }
     }
-    if let Ok(out) = Command::new("which").arg("agent").output() {
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() { return Some(p); }
+    // Try `command -v` (POSIX) then `which`
+    for cmd in &["sh", "which"] {
+        let args: &[&str] = if *cmd == "sh" { &["-c", "command -v agent"] } else { &["agent"] };
+        if let Ok(out) = Command::new(cmd).args(args).output() {
+            if out.status.success() {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !p.is_empty() { return Some(p); }
+            }
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    for loc in &["/usr/local/bin/agent", "/opt/homebrew/bin/agent"] {
+    for loc in &["/usr/local/bin/agent", "/opt/homebrew/bin/agent", "/usr/bin/agent"] {
         if std::path::Path::new(loc).exists() { return Some(loc.to_string()); }
     }
     if !home.is_empty() {
