@@ -1,5 +1,5 @@
-// cursor-bridge — Claude Code on Cursor's backend
-// One binary. Claude Code on Cursor's backend. Zero config.
+// cursor-bridge — Claude Code on Cursor's backend.
+// One binary. Zero config.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn e(msg: &str) {
-    eprintln!("ccp: {msg}");
+fn log(msg: &str) {
+    eprintln!("bridge: {msg}");
 }
 
 fn main() {
@@ -20,45 +20,32 @@ fn main() {
         println!("cursor-bridge — Claude Code on Cursor's backend");
         println!("Usage: cursor-bridge [claude-args...]");
         println!();
-        println!("One binary. Zero config. Just like `claude`, but runs on your Cursor subscription.");
-        println!();
         println!("  cursor-bridge              interactive");
         println!("  cursor-bridge \"prompt\"     one-shot");
         println!("  cursor-bridge -p \"prompt\"  pipe mode");
         return;
     }
 
-    // 1. Read Cursor token
     let token = get_cursor_token();
     if token.is_empty() {
-        e("No Cursor token found. Run `agent login` first.");
+        log("No Cursor token found. Run `agent login` first.");
         std::process::exit(1);
     }
-    e(&format!("token found: {}..{}", &token[..12], &token[token.len()-4..]));
+    log(&format!("token: {}..{}", &token[..12], &token[token.len()-4..]));
 
-    // 2. Start proxy on random port
     let proxy = match Proxy::start(&token) {
         Ok(p) => p,
-        Err(err) => {
-            e(&format!("Failed to start proxy: {err}"));
-            std::process::exit(1);
-        }
+        Err(err) => { log(&format!("proxy failed: {err}")); std::process::exit(1); }
     };
 
-    let port = proxy.port();
-
-    // 3. Spawn claude with env overrides
     let mut cmd = Command::new("claude");
-    cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"));
+    cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{}", proxy.port()));
     cmd.env("ANTHROPIC_AUTH_TOKEN", "sk-any");
     cmd.env("ANTHROPIC_API_KEY", "");
     cmd.env("ANTHROPIC_MODEL", "cursor-auto");
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
 
-    for arg in &claude_args {
-        cmd.arg(arg);
-    }
-
+    for arg in &claude_args { cmd.arg(arg); }
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
@@ -66,98 +53,71 @@ fn main() {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
-            e(&format!("Failed to spawn claude: {err}"));
-            e("Make sure Claude Code is installed: https://claude.ai/code");
+            log(&format!("Failed to spawn claude: {err}"));
+            log("Install: https://claude.ai/code");
             std::process::exit(1);
         }
     };
 
-    e(&format!("claude spawned (pid {}), waiting...", child.id()));
-
     let status = child.wait();
     drop(proxy);
-
-    match status {
-        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
-        Err(err) => {
-            e(&format!("claude process error: {err}"));
-            std::process::exit(1);
-        }
-    }
+    std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(0));
 }
 
-// ─── Token ─────────────────────────────────────────────────────────────
+// ─── Token ────────────────────────────────────────────────────
 
 fn get_cursor_token() -> String {
-    if let Ok(t) = std::env::var("CURSOR_TOKEN") {
-        if !t.is_empty() {
-            return t;
+    for var in &["CURSOR_TOKEN", "CURSOR_API_KEY"] {
+        if let Ok(t) = std::env::var(var) {
+            if !t.is_empty() { return t; }
         }
     }
-    if let Ok(t) = std::env::var("CURSOR_API_KEY") {
-        if !t.is_empty() {
-            return t;
-        }
-    }
-    let output = Command::new("security")
+    let out = Command::new("security")
         .args(["find-generic-password", "-s", "cursor-access-token", "-w"])
         .output();
-    match output {
+    match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
 }
 
-// ─── Proxy ─────────────────────────────────────────────────────────────
+// ─── Proxy ────────────────────────────────────────────────────
 
-struct Proxy {
-    port: u16,
-    _shutdown: Arc<AtomicBool>,
-}
+struct Proxy { port: u16, _shutdown: Arc<AtomicBool> }
 
 impl Proxy {
     fn start(token: &str) -> std::io::Result<Self> {
-        let token = token.to_string();
+        let t = token.to_string();
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
 
-        std::thread::Builder::new()
-            .name("ccp-proxy".into())
-            .spawn(move || {
-                let _ = listener.set_nonblocking(true);
-                loop {
-                    if sd.load(Ordering::Relaxed) {
-                        break;
+        std::thread::Builder::new().name("bridge-proxy".into()).spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            loop {
+                if sd.load(Ordering::Relaxed) { break; }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let ct = t.clone();
+                        std::thread::Builder::new().name("bridge-conn".into())
+                            .spawn(move || handle_connection(stream, &ct)).ok();
                     }
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let t = token.clone();
-                            std::thread::Builder::new()
-                                .name("ccp-conn".into())
-                                .spawn(move || handle_connection(stream, &t))
-                                .ok();
-                        }
-                        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        Err(_) => break,
-                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock =>
+                        std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
                 }
-            })
-            .ok();
+            }
+        }).ok();
 
-        e(&format!("proxy on 127.0.0.1:{port}"));
+        log(&format!("proxy on 127.0.0.1:{port}"));
         Ok(Self { port, _shutdown: shutdown })
     }
 
-    fn port(&self) -> u16 {
-        self.port
-    }
+    fn port(&self) -> u16 { self.port }
 }
 
-// ─── HTTP ──────────────────────────────────────────────────────────────
+// ─── HTTP ─────────────────────────────────────────────────────
 
 fn handle_connection(stream: TcpStream, token: &str) {
     let mut reader = BufReader::new(&stream);
@@ -167,9 +127,7 @@ fn handle_connection(stream: TcpStream, token: &str) {
     }
 
     let parts: Vec<&str> = req_line.trim().splitn(3, ' ').collect();
-    if parts.len() < 2 {
-        return;
-    }
+    if parts.len() < 2 { return; }
     let method = parts[0];
     let path = parts[1];
 
@@ -177,9 +135,7 @@ fn handle_connection(stream: TcpStream, token: &str) {
     let mut is_chunked = false;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) || line.trim().is_empty() {
-            break;
-        }
+        if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) || line.trim().is_empty() { break; }
         let lower = line.to_lowercase();
         if lower.starts_with("content-length:") {
             content_length = line.split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
@@ -196,13 +152,11 @@ fn handle_connection(stream: TcpStream, token: &str) {
     } else if is_chunked {
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) {
-                break;
-            }
-            let sz = usize::from_str_radix(line.trim(), 16).unwrap_or(0);
-            if sz == 0 {
-                break;
-            }
+            if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) { break; }
+            // Chunk size — strip extensions after ';'
+            let size_str = line.split(';').next().unwrap_or("").trim();
+            let sz = usize::from_str_radix(size_str, 16).unwrap_or(0);
+            if sz == 0 { break; }
             let mut chunk = vec![0u8; sz];
             let _ = reader.read_exact(&mut chunk);
             body.extend_from_slice(&chunk);
@@ -210,53 +164,36 @@ fn handle_connection(stream: TcpStream, token: &str) {
         }
     }
 
-    e(&format!("  {} {} ({} bytes)", method, path, body.len()));
+    log(&format!("  {} {} ({}b)", method, path, body.len()));
 
     match (method, path) {
         ("HEAD", "/api/hello") | ("GET", "/api/hello") => respond_hello(stream, method == "HEAD"),
         ("GET", "/v1/models") | ("GET", "/models") => respond_models(stream),
-        ("POST", p) if p.starts_with("/v1/messages") || p.starts_with("/messages") => {
-            handle_messages(stream, &body, token);
-        }
+        ("POST", p) if p.starts_with("/v1/messages") || p.starts_with("/messages") =>
+            handle_messages(stream, &body, token),
         ("OPTIONS", _) => respond_cors(stream),
         _ => respond_404(stream),
     }
 }
 
-fn respond_cors(mut stream: TcpStream) {
-    let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n");
+fn respond_cors(mut s: TcpStream) { let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n"); }
+fn respond_404(mut s: TcpStream) { let _ = s.write_all(b"HTTP/1.1 404\r\nContent-Length: 2\r\n\r\n{}"); }
+fn respond_hello(mut s: TcpStream, head: bool) {
+    let b = r#"{"status":"ok"}"#;
+    let h = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-request-id: bridge-{}\r\n\r\n{}", b.len(), std::process::id(), if head { "" } else { b });
+    let _ = s.write_all(h.as_bytes());
 }
-
-fn respond_404(mut stream: TcpStream) {
-    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}");
-}
-
-fn respond_hello(mut stream: TcpStream, head: bool) {
-    let body = r#"{"status":"ok"}"#;
-    let hdr = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-request-id: ccp-{}\r\n\r\n{}",
-        body.len(),
-        std::process::id(),
-        if head { "" } else { body }
-    );
-    let _ = stream.write_all(hdr.as_bytes());
-}
-
-fn respond_models(mut stream: TcpStream) {
-    let models = r#"{"data":[
+fn respond_models(mut s: TcpStream) {
+    let body = r#"{"data":[
         {"type":"model","id":"cursor-auto","display_name":"Cursor Auto"},
         {"type":"model","id":"cursor-smart","display_name":"Cursor Smart"},
         {"type":"model","id":"default","display_name":"Default"}
     ]}"#;
-    let hdr = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        models.len(),
-        models
-    );
-    let _ = stream.write_all(hdr.as_bytes());
+    let h = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+    let _ = s.write_all(h.as_bytes());
 }
 
-// ─── Messages ──────────────────────────────────────────────────────────
+// ─── Messages ─────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
 #[allow(dead_code)]
@@ -274,6 +211,45 @@ struct Message {
     content: serde_json::Value,
 }
 
+// ─── Prompt building ──────────────────────────────────────────
+
+fn extract_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => {
+            let mut out = String::new();
+            for block in arr {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(t) = block["text"].as_str() { out.push_str(t); out.push('\n'); }
+                    }
+                    Some("tool_use") => {
+                        let name = block["name"].as_str().unwrap_or("unknown");
+                        let input = block["input"].to_string();
+                        out.push_str(&format!("[TOOL_USE: {name}]\n{input}\n[/TOOL_USE]\n"));
+                    }
+                    Some("tool_result") => {
+                        let id = block["tool_use_id"].as_str().unwrap_or("");
+                        let content = extract_text(&block["content"]);
+                        let error = block["is_error"].as_bool().unwrap_or(false);
+                        if error {
+                            out.push_str(&format!("[TOOL_ERROR: {id}]\n{content}\n[/TOOL_ERROR]\n"));
+                        } else {
+                            out.push_str(&format!("[TOOL_RESULT: {id}]\n{content}\n[/TOOL_RESULT]\n"));
+                        }
+                    }
+                    Some("thinking") => {
+                        if let Some(t) = block["thinking"].as_str() { out.push_str(&format!("[thinking]\n{t}\n[/thinking]\n")); }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
 fn extract_system_text(system: &Option<serde_json::Value>) -> String {
     match system {
         None => String::new(),
@@ -287,78 +263,35 @@ fn extract_system_text(system: &Option<serde_json::Value>) -> String {
 
 fn build_prompt(messages: &[Message], system: &Option<serde_json::Value>) -> String {
     let mut prompt = String::new();
-    let sys_text = extract_system_text(system);
-    if !sys_text.is_empty() {
-        prompt.push_str("[SYSTEM]\n");
-        prompt.push_str(&sys_text);
-        prompt.push_str("\n[/SYSTEM]\n\n");
-    }
+    let sys = extract_system_text(system);
+    if !sys.is_empty() { prompt.push_str(&format!("[SYSTEM]\n{sys}\n[/SYSTEM]\n\n")); }
+
     for msg in messages {
         let role = match msg.role.as_str() {
             "assistant" => "Assistant",
+            "user" => "User",
             _ => "User",
         };
-        prompt.push('[');
-        prompt.push_str(role);
-        prompt.push_str("]\n");
-        match &msg.content {
-            serde_json::Value::String(s) => prompt.push_str(s),
-            serde_json::Value::Array(arr) => {
-                for block in arr {
-                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                        prompt.push_str(text);
-                        prompt.push('\n');
-                    }
-                }
-            }
-            _ => {}
-        }
-        prompt.push_str("\n[/");
-        prompt.push_str(role);
-        prompt.push_str("]\n\n");
+        prompt.push_str(&format!("[{role}]\n{}\n[/{role}]\n\n", extract_text(&msg.content)));
     }
     prompt.push_str("[Assistant]\n");
     prompt
 }
 
-fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
-    let req: MessagesRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            let err = format!("{{\"error\":\"{}\"}}", e.to_string().replace('"', "'"));
-            let resp = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", err.len(), err);
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
-            return;
-        }
-    };
-
-    let stream_mode = req.stream.unwrap_or(true);
-    if stream_mode {
-        handle_streaming(stream, &req);
-    } else {
-        handle_blocking(stream, &req);
-    }
-}
+// ─── Agent ────────────────────────────────────────────────────
 
 fn find_agent() -> Option<String> {
     if let Ok(path) = std::env::var("AGENT_PATH") {
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
+        if !path.is_empty() && std::path::Path::new(&path).exists() { return Some(path); }
     }
     if let Ok(out) = Command::new("which").arg("agent").output() {
         if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() { return Some(path); }
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() { return Some(p); }
         }
     }
-    // Common fallback locations
     let home = std::env::var("HOME").unwrap_or_default();
-    for loc in &[
-        "/usr/local/bin/agent",
-        "/opt/homebrew/bin/agent",
-    ] {
+    for loc in &["/usr/local/bin/agent", "/opt/homebrew/bin/agent"] {
         if std::path::Path::new(loc).exists() { return Some(loc.to_string()); }
     }
     if !home.is_empty() {
@@ -368,187 +301,158 @@ fn find_agent() -> Option<String> {
     None
 }
 
-fn run_agent(prompt: &str) -> std::io::Result<std::process::Child> {
-    let agent_path = find_agent().unwrap_or_else(|| {
-        e("agent not found. Install Cursor CLI or set AGENT_PATH.");
-        std::process::exit(1);
-    });
-    e(&format!("spawning: {agent_path}"));
-    // Pass prompt as last arg so agent reads it from argv, not stdin
-    Command::new(agent_path)
+fn spawn_agent() -> std::io::Result<std::process::Child> {
+    let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
+    log(&format!("spawning: {path}"));
+    Command::new(path)
         .args(["--mode", "ask", "--print", "--output-format", "stream-json", "--model", "auto", "--trust"])
-        .arg(prompt)  // prompt as positional arg
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
 }
 
+fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
+    if let Some(stdin) = agent.stdin.as_mut() {
+        let _ = stdin.write_all(prompt.as_bytes());
+        let _ = stdin.flush();
+    }
+}
+
+// ─── Blocking ─────────────────────────────────────────────────
+
 fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let prompt = build_prompt(req.messages.as_deref().unwrap_or_default(), &req.system);
     let model = req.model.as_deref().unwrap_or("cursor-auto");
 
-    let mut agent = match run_agent(&prompt) {
-        Ok(a) => a,
-        Err(e) => {
-            let err = format!("{{\"error\":\"agent: {e}\"}}");
-            let resp = format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", err.len(), err);
-            let _ = stream.write_all(resp.as_bytes());
-            return;
-        }
-    };
+    let mut agent = match spawn_agent() { Ok(a) => a, Err(e) => {
+        let err = format!("{{\"error\":\"agent: {e}\"}}");
+        let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
+        return;
+    }};
+    write_prompt(&mut agent, &prompt);
 
-    // Prompt already passed via argv in run_agent, stdin is null
-
-    let stdout = agent.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
+    let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut text = String::new();
     let mut usage = serde_json::json!({});
 
     for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            _ => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
+        let line = match line { Ok(l) => l, _ => break };
+        if line.trim().is_empty() { continue; }
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             if event["type"] == "assistant" {
                 if let Some(arr) = event["message"]["content"].as_array() {
                     for block in arr {
-                        if let Some(t) = block["text"].as_str() {
-                            text.push_str(t);
-                        }
+                        if let Some(t) = block["text"].as_str() { text.push_str(t); }
                     }
                 }
             }
-            if event["type"] == "result" {
-                usage = event["usage"].clone();
-            }
+            if event["type"] == "result" { usage = event["usage"].clone(); }
         }
     }
-
     let _ = agent.wait();
 
     let resp = serde_json::json!({
-        "id": format!("msg_{}", std::process::id()),
-        "type": "message", "role": "assistant",
-        "content": [{"type": "text", "text": text}],
-        "model": model, "stop_reason": "end_turn",
-        "usage": {
-            "input_tokens": usage["inputTokens"].as_u64().unwrap_or(0),
-            "output_tokens": usage["outputTokens"].as_u64().unwrap_or(0),
-        }
+        "id": format!("msg_{}", std::process::id()), "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": text}], "model": model, "stop_reason": "end_turn",
+        "usage": { "input_tokens": usage["inputTokens"].as_u64().unwrap_or(0), "output_tokens": usage["outputTokens"].as_u64().unwrap_or(0) }
     });
-
     let body = serde_json::to_string(&resp).unwrap_or_default();
-    let hdr = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
-    let _ = stream.write_all(hdr.as_bytes());
+    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+}
+
+// ─── Streaming ────────────────────────────────────────────────
+
+fn write_sse(stream: &mut TcpStream, event_type: &str, data: &serde_json::Value) -> std::io::Result<()> {
+    let json = serde_json::to_string(data)?;
+    stream.write_all(b"event: ")?;
+    stream.write_all(event_type.as_bytes())?;
+    stream.write_all(b"\ndata: ")?;
+    stream.write_all(json.as_bytes())?;
+    stream.write_all(b"\n\n")?;
+    stream.flush()
 }
 
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let prompt = build_prompt(req.messages.as_deref().unwrap_or_default(), &req.system);
     let model = req.model.as_deref().unwrap_or("cursor-auto");
 
-    let mut agent = match run_agent(&prompt) {
-        Ok(a) => a,
-        Err(e) => {
-            let err = format!("{{\"error\":\"agent: {e}\"}}");
-            let resp = format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", err.len(), err);
-            let _ = stream.write_all(resp.as_bytes());
-            return;
-        }
-    };
-
-    e(&format!("prompt: {} bytes", prompt.len()));
-
-    // Send SSE response headers
-    let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
-    if stream.write_all(hdr.as_bytes()).is_err() {
-        let _ = agent.wait();
+    let mut agent = match spawn_agent() { Ok(a) => a, Err(e) => {
+        let err = format!("{{\"error\":\"agent: {e}\"}}");
+        let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
         return;
-    }
-    let _ = stream.flush();
-    e("SSE headers sent");
+    }};
+    log(&format!("prompt: {}b", prompt.len()));
+    write_prompt(&mut agent, &prompt);
+
+    // SSE response headers
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
     let _ = stream.flush();
 
     let msg_id = format!("msg_{}", std::process::id());
-
-    // message_start
-    let start = serde_json::json!({
+    let _ = write_sse(&mut stream, "message_start", &serde_json::json!({
         "type": "message_start",
-        "message": {
-            "id": msg_id, "type": "message", "role": "assistant",
-            "content": [], "model": model,
-            "stop_reason": null,
-            "usage": {"input_tokens": 0, "output_tokens": 0}
-        }
-    });
-    if write_sse(&mut stream, &start).is_err() {
-        let _ = agent.wait();
-        return;
-    }
+        "message": { "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
+    }));
 
-    let stdout = agent.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
-    let mut handled = false;
-    let mut started = false;
-    let mut line_count = 0;
+    let reader = BufReader::new(agent.stdout.take().unwrap());
+    let mut content_index = 0i32;
+    let mut result_received = false;
 
     for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            _ => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        line_count += 1;
+        let line = match line { Ok(l) => l, _ => break };
+        if line.trim().is_empty() { continue; }
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             match event["type"].as_str() {
                 Some("assistant") => {
-                    if let Some(arr) = event["message"]["content"].as_array() {
-                        for block in arr {
-                            if let Some(text) = block["text"].as_str() {
-                                if !started {
-                                    started = true;
-                                    let cb = serde_json::json!({
-                                        "type": "content_block_start", "index": 0,
-                                        "content_block": {"type": "text", "text": text}
-                                    });
-                                    if write_sse(&mut stream, &cb).is_err() {
-                                        return;
+                    if let Some(blocks) = event["message"]["content"].as_array() {
+                        for block in blocks {
+                            let block_type = block["type"].as_str().unwrap_or("text");
+                            match block_type {
+                                "text" => {
+                                    if let Some(text) = block["text"].as_str() {
+                                        let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
+                                            "type": "content_block_start", "index": content_index,
+                                            "content_block": {"type": "text", "text": text}
+                                        }));
+                                        let _ = write_sse(&mut stream, "content_block_delta", &serde_json::json!({
+                                            "type": "content_block_delta", "index": content_index,
+                                            "delta": {"type": "text_delta", "text": text}
+                                        }));
+                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                                            "type": "content_block_stop", "index": content_index
+                                        }));
+                                        content_index += 1;
                                     }
                                 }
-                                let delta = serde_json::json!({
-                                    "type": "content_block_delta", "index": 0,
-                                    "delta": {"type": "text_delta", "text": text}
-                                });
-                                if write_sse(&mut stream, &delta).is_err() {
-                                    return;
+                                "tool_use" => {
+                                    let name = block["name"].as_str().unwrap_or("unknown");
+                                    let input = block["input"].clone();
+                                    let fallback_id = format!("toolu_{}", content_index);
+                                    let tool_id = block["id"].as_str().unwrap_or(&fallback_id);
+                                    let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
+                                        "type": "content_block_start", "index": content_index,
+                                        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": input}
+                                    }));
+                                    let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                                        "type": "content_block_stop", "index": content_index
+                                    }));
+                                    content_index += 1;
                                 }
+                                _ => {} // skip thinking, etc
                             }
                         }
                     }
                 }
                 Some("result") => {
-                    // content_block_stop
-                    if started {
-                        let _ = write_sse(&mut stream, &serde_json::json!({"type": "content_block_stop", "index": 0}));
-                    }
-                    handled = true;
+                    result_received = true;
                     let usage = &event["usage"];
-                    let done = serde_json::json!({
+                    let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn"},
-                        "usage": {
-                            "input_tokens": usage["inputTokens"].as_u64().unwrap_or(0),
-                            "output_tokens": usage["outputTokens"].as_u64().unwrap_or(0),
-                        }
-                    });
-                    let _ = write_sse(&mut stream, &done);
-                    let _ = write_sse(&mut stream, &serde_json::json!({"type": "message_stop"}));
+                        "usage": { "input_tokens": usage["inputTokens"].as_u64().unwrap_or(0), "output_tokens": usage["outputTokens"].as_u64().unwrap_or(0) }
+                    }));
+                    let _ = write_sse(&mut stream, "message_stop", &serde_json::json!({"type": "message_stop"}));
                     let _ = stream.write_all(b"data: [DONE]\n\n");
                     let _ = stream.flush();
                 }
@@ -557,19 +461,13 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
         }
     }
 
-    e(&format!("agent output: {line_count} lines, started={started}, handled={handled}"));
-
-    // Fallback if result event wasn't received (e.g., agent error)
-    if !handled {
-        e("result not handled, sending fallback message_stop");
-        if started {
-            let _ = write_sse(&mut stream, &serde_json::json!({"type": "content_block_stop", "index": 0}));
-        }
-        let _ = write_sse(&mut stream, &serde_json::json!({
+    if !result_received {
+        log("result not received, sending fallback message_stop");
+        let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
             "type": "message_delta", "delta": {"stop_reason": "end_turn"},
             "usage": {"input_tokens": 0, "output_tokens": 0}
         }));
-        let _ = write_sse(&mut stream, &serde_json::json!({"type": "message_stop"}));
+        let _ = write_sse(&mut stream, "message_stop", &serde_json::json!({"type": "message_stop"}));
         let _ = stream.write_all(b"data: [DONE]\n\n");
         let _ = stream.flush();
     }
@@ -577,14 +475,18 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let _ = agent.wait();
 }
 
-fn write_sse(stream: &mut TcpStream, data: &serde_json::Value) -> std::io::Result<()> {
-    let json = serde_json::to_string(data)?;
-    let event_type = data["type"].as_str().unwrap_or("");
-    stream.write_all(b"event: ")?;
-    stream.write_all(event_type.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.write_all(b"data: ")?;
-    stream.write_all(json.as_bytes())?;
-    stream.write_all(b"\n\n")?;
-    stream.flush()
+fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
+    let req: MessagesRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            let err = format!("{{\"error\":\"{}\"}}", e.to_string().replace('"', "'"));
+            let resp = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len());
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            return;
+        }
+    };
+
+    if req.stream.unwrap_or(true) { handle_streaming(stream, &req); }
+    else { handle_blocking(stream, &req); }
 }

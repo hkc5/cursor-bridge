@@ -3,6 +3,11 @@ name = "cursor-bridge"
 version = "0.1.0"
 edition = "2021"
 description = "One binary. Claude Code on Cursor's backend. Zero config."
+license = "MIT"
+repository = "https://github.com/hkc5/cursor-bridge"
+homepage = "https://github.com/hkc5/cursor-bridge"
+keywords = ["cursor", "claude", "proxy", "ai", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
