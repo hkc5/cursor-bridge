@@ -308,8 +308,18 @@ fn find_agent() -> Option<String> {
 fn spawn_agent() -> std::io::Result<std::process::Child> {
     let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
     log(&format!("spawning: {path}"));
+
+    // Run agent in temp dir so it can't touch project files
+    let sandbox = std::env::temp_dir().join(format!("cursor-bridge-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&sandbox);
+    log(&format!("sandbox: {}", sandbox.display()));
+
+    // Default mode (no --mode) = full agent with tool execution.
+    // --force auto-approves tool calls in non-interactive mode.
+    // --trust skips workspace trust prompt.
     Command::new(path)
-        .args(["--mode", "ask", "--print", "--output-format", "stream-json", "--model", "auto", "--trust"])
+        .args(["--print", "--force", "--output-format", "stream-json", "--model", "auto", "--trust"])
+        .current_dir(&sandbox)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
