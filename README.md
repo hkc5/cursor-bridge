@@ -28,7 +28,7 @@ That's it. No proxy management. No env vars. Everything automatic.
 ```
 cursor-bridge (Rust binary)
   ├── Starts a local HTTP proxy on a random port
-  ├── Reads your Cursor auth token from macOS keychain
+  ├── Reads your Cursor auth token from macOS keychain (or CURSOR_TOKEN env var on Linux)
   ├── Spawns `claude` with env vars pointing at the proxy
   ├── Proxy translates Anthropic API calls → Cursor agent CLI
   └── Cleans up on exit
@@ -53,9 +53,11 @@ Or download a binary from Releases.
 
 ## Requirements
 
-- macOS (keychain for auth token)
+- **macOS** or **Linux**
 - Cursor subscription (with `agent` CLI in PATH)
 - Claude Code CLI (`claude` in PATH)
+- **macOS**: token auto-read from keychain
+- **Linux**: set `CURSOR_TOKEN` env var (no keychain fallback)
 
 ## How it differs from other proxies
 
@@ -79,7 +81,7 @@ cursor-bridge replaces `claude` entirely — it manages the proxy lifecycle inte
 
 ## Caveats
 
-- **Only macOS** for now (keychain access). Linux support can be added.
+- **Linux**: requires `CURSOR_TOKEN` env var (no keychain support).
 - **No workspace sandboxing** — the agent runs in your current directory.
 - **Single account** — no multi-account rotation (yet).
 
