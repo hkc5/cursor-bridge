@@ -15,7 +15,6 @@ fn e(msg: &str) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let claude_args: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
-    let is_pipe = claude_args.iter().any(|a| *a == "-p" || *a == "--print");
 
     if claude_args.iter().any(|a| *a == "--help" || *a == "-h") {
         println!("cursor-bridge — Claude Code on Cursor's backend");
@@ -58,12 +57,6 @@ fn main() {
 
     for arg in &claude_args {
         cmd.arg(arg);
-    }
-
-    if is_pipe || !claude_args.is_empty() {
-        if !claude_args.contains(&"--dangerously-skip-permissions") {
-            cmd.arg("--dangerously-skip-permissions");
-        }
     }
 
     cmd.stdin(Stdio::inherit());
