@@ -34,18 +34,19 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: cursor-bridge-linux
-          path: .
       - name: Create Release
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
-            cursor-bridge
+            cursor-bridge-linux/cursor-bridge
         env:
           GH_TOKEN: ${{ github.token }}
