@@ -41,12 +41,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: cursor-bridge-linux
+          path: .
       - name: Create Release
         run: |
+          chmod +x cursor-bridge
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
-            cursor-bridge-linux/cursor-bridge
+            cursor-bridge
         env:
           GH_TOKEN: ${{ github.token }}
