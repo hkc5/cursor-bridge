@@ -59,15 +59,23 @@ Or download a binary from Releases.
 
 ## How it differs from other proxies
 
-**cursor-bridge is not a server, not a daemon, not a background process.** You don't start it separately and leave it running. It's a drop-in replacement for `claude`.
+**All other solutions are background servers you manage. cursor-bridge is a command you run.**
 
-| Other proxies | cursor-bridge |
+Existing proxies (`cursor-api-proxy`, `cursor-composer-in-claude`, `cursor-proxy`) are Node.js servers that live in your process list, occupy a port, and need manual env var wiring. They don't ship with Claude Code — they sit between you and it, adding ceremony.
+
+**cursor-bridge is the opposite.** There is nothing to start, stop, or configure. It *is* the session:
+
+| The old way | cursor-bridge |
 |---|---|
-| Run as a background server | Starts and stops with your session |
-| Need to set env vars manually | Sets everything automatically |
-| Need to find the right port | Random port, no conflicts |
-| Multiple npm dependencies | Single Rust binary, one dependency (~740KB) |
-| Node.js runtime required | Statically compiled |
+| Start a proxy daemon, note the port, set env vars, *then* run `claude` | Run `cursor-bridge` — done |
+| Background process that outlives your session | Lives and dies with your terminal |
+| Pick a port, pray it doesn't clash | Random port, zero conflicts |
+| `npm install` + `npx` + Node.js runtime (60+ MB) | One Rust binary, ~780 KB, statically compiled |
+| Multiple npm packages, peer deps, version mismatches | `cargo install` or download. One binary. Nothing else. |
+
+No daemon. No `npm install`. No env vars. No port hunting. No cleanup. Just a single binary that works.
+
+cursor-bridge replaces `claude` entirely — it manages the proxy lifecycle internally, spawns the CLI, and cleans up after itself when you're done.
 
 ## Caveats
 
