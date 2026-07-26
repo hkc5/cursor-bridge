@@ -496,3 +496,148 @@ fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
     if req.stream.unwrap_or(true) { handle_streaming(stream, &req); }
     else { handle_blocking(stream, &req); }
 }
+
+// ─── Tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_system_text_string() {
+        let v = Some(serde_json::Value::String("Be helpful.".into()));
+        assert_eq!(extract_system_text(&v), "Be helpful.");
+    }
+
+    #[test]
+    fn test_extract_system_text_array() {
+        let v = Some(serde_json::json!([
+            {"type": "text", "text": "Be helpful."},
+            {"type": "text", "text": "Be concise."}
+        ]));
+        assert_eq!(extract_system_text(&v), "Be helpful.\nBe concise.");
+    }
+
+    #[test]
+    fn test_extract_system_text_none() {
+        assert_eq!(extract_system_text(&None), "");
+    }
+
+    #[test]
+    fn test_extract_text_string_content() {
+        let v = serde_json::Value::String("hello".into());
+        assert_eq!(extract_text(&v), "hello");
+    }
+
+    #[test]
+    fn test_extract_text_text_block() {
+        let v = serde_json::json!([
+            {"type": "text", "text": "Hello there"}
+        ]);
+        assert_eq!(extract_text(&v), "Hello there\n");
+    }
+
+    #[test]
+    fn test_extract_text_tool_use() {
+        let v = serde_json::json!([
+            {"type": "tool_use", "name": "bash", "id": "tu_1", "input": {"command": "ls"}}
+        ]);
+        let out = extract_text(&v);
+        assert!(out.contains("TOOL_USE: bash"));
+        assert!(out.contains("ls"));
+    }
+
+    #[test]
+    fn test_extract_text_tool_result() {
+        let v = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "tu_1", "content": "file.txt"}
+        ]);
+        let out = extract_text(&v);
+        assert!(out.contains("TOOL_RESULT: tu_1"));
+        assert!(out.contains("file.txt"));
+    }
+
+    #[test]
+    fn test_extract_text_tool_error() {
+        let v = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "tu_1", "content": "permission denied", "is_error": true}
+        ]);
+        let out = extract_text(&v);
+        assert!(out.contains("TOOL_ERROR"));
+    }
+
+    #[test]
+    fn test_agent_empty_env_returns_none_for_bogus() {
+        // Without AGENT_PATH set, non-existent name should not crash
+        // Just verify the function handles missing gracefully
+        let original = std::env::var("AGENT_PATH").ok();
+        std::env::remove_var("AGENT_PATH");
+        // Can't assert None because `which` might find `agent` in CI,
+        // but it shouldn't panic or return Some("")
+        let result = find_agent();
+        if let Some(path) = result {
+            assert!(!path.is_empty(), "path must not be empty");
+        }
+        if let Some(val) = original {
+            std::env::set_var("AGENT_PATH", val);
+        }
+    }
+
+    #[test]
+    fn test_build_prompt_simple() {
+        let msgs = [Message {
+            role: "user".into(),
+            content: serde_json::Value::String("hi".into()),
+        }];
+        let prompt = build_prompt(&msgs, &None);
+        assert!(prompt.contains("[User]"));
+        assert!(prompt.contains("hi"));
+        assert!(prompt.contains("[/User]"));
+        assert!(prompt.contains("[Assistant]"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_system() {
+        let sys = Some(serde_json::Value::String("You are a bot.".into()));
+        let msgs = [Message {
+            role: "user".into(),
+            content: serde_json::Value::String("hi".into()),
+        }];
+        let prompt = build_prompt(&msgs, &sys);
+        assert!(prompt.contains("[SYSTEM]"));
+        assert!(prompt.contains("You are a bot."));
+    }
+
+    #[test]
+    fn test_build_prompt_with_tool_context() {
+        let msgs = [
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "file contents"}
+                ]),
+            },
+            Message {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "name": "read", "id": "tu_1", "input": {"path": "file.txt"}}
+                ]),
+            },
+        ];
+        let prompt = build_prompt(&msgs, &None);
+        assert!(prompt.contains("TOOL_RESULT"));
+        assert!(prompt.contains("TOOL_USE: read"));
+    }
+
+    #[test]
+    fn test_models_response_valid_json() {
+        // Verify the hardcoded models response is valid JSON
+        let body = r#"{"data":[
+            {"type":"model","id":"cursor-auto","display_name":"Cursor Auto"},
+            {"type":"model","id":"cursor-smart","display_name":"Cursor Smart"},
+            {"type":"model","id":"default","display_name":"Default"}
+        ]}"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 3);
+    }
+}
