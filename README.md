@@ -2,7 +2,18 @@
 
 **One binary. Claude Code on Cursor's backend. Zero config.**
 
-Just like `claude`, but runs on your Cursor subscription. No proxy management. No environment variables to set.
+## Why does this exist?
+
+You have a **Cursor subscription**. You want to use **Claude Code** (the CLI).
+Cursor's **Auto model** is included with your subscription — free, unlimited, no extra per-token cost.
+
+Without cursor-bridge, you'd pay separately for Anthropic API credits or a Claude Pro plan.
+With cursor-bridge, you just run `cursor-bridge` and it works — Claude Code runs on your Cursor backend.
+
+**Use cases:**
+- You're already paying for Cursor → get Claude Code for free on top
+- You want Claude Code's agent capabilities (file editing, shell commands, tool use) without Anthropic billing
+- Cursor's Auto model is free and unlimited with subscription — Claude Code becomes effectively free to run
 
 ```bash
 cursor-bridge                         # interactive session
@@ -10,7 +21,7 @@ cursor-bridge "refactor this file"    # one-shot prompt
 cursor-bridge -p "list files"         # pipe mode
 ```
 
-That's it. Everything else is automatic.
+That's it. No proxy management. No env vars. Everything automatic.
 
 ## How it works
 
@@ -55,8 +66,8 @@ Or download a binary from Releases.
 | Run as a background server | Starts and stops with your session |
 | Need to set env vars manually | Sets everything automatically |
 | Need to find the right port | Random port, no conflicts |
-| Multiple npm dependencies | Single Rust binary, one dependency |
-| Node.js runtime required | Statically compiled (~740KB) |
+| Multiple npm dependencies | Single Rust binary, one dependency (~740KB) |
+| Node.js runtime required | Statically compiled |
 
 ## Caveats
 
