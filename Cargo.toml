@@ -1,6 +1,6 @@
 [package]
 name = "cursor-bridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "One binary. Claude Code on Cursor's backend. Zero config."
 license = "MIT"
