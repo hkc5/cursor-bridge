@@ -328,13 +328,14 @@ fn build_prompt(messages: &[Message], system: &Option<serde_json::Value>) -> Str
     prompt
 }
 
-fn handle_messages(stream: TcpStream, body: &[u8], _token: &str) {
+fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
     let req: MessagesRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
             let err = format!("{{\"error\":\"{}\"}}", e.to_string().replace('"', "'"));
-            let _resp = format!("HTTP/1.1 400\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", err.len(), err);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let resp = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", err.len(), err);
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
             return;
         }
     };
@@ -347,8 +348,38 @@ fn handle_messages(stream: TcpStream, body: &[u8], _token: &str) {
     }
 }
 
+fn find_agent() -> Option<String> {
+    if let Ok(path) = std::env::var("AGENT_PATH") {
+        if !path.is_empty() && std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+    if let Ok(out) = Command::new("which").arg("agent").output() {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() { return Some(path); }
+        }
+    }
+    // Common fallback locations
+    let home = std::env::var("HOME").unwrap_or_default();
+    for loc in &[
+        "/usr/local/bin/agent",
+        "/opt/homebrew/bin/agent",
+    ] {
+        if std::path::Path::new(loc).exists() { return Some(loc.to_string()); }
+    }
+    if !home.is_empty() {
+        let local = format!("{home}/.local/bin/agent");
+        if std::path::Path::new(&local).exists() { return Some(local); }
+    }
+    None
+}
+
 fn run_agent(prompt: &str) -> std::io::Result<std::process::Child> {
-    let agent_path = std::env::var("AGENT_PATH").unwrap_or_else(|_| "/Users/hakancan/.local/bin/agent".into());
+    let agent_path = find_agent().unwrap_or_else(|| {
+        e("agent not found. Install Cursor CLI or set AGENT_PATH.");
+        std::process::exit(1);
+    });
     e(&format!("spawning: {agent_path}"));
     // Pass prompt as last arg so agent reads it from argv, not stdin
     Command::new(agent_path)
@@ -374,10 +405,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
         }
     };
 
-    if let Some(stdin) = agent.stdin.as_mut() {
-        let _ = stdin.write_all(prompt.as_bytes());
-        let _ = stdin.flush();
-    }
+    // Prompt already passed via argv in run_agent, stdin is null
 
     let stdout = agent.stdout.take().unwrap();
     let reader = BufReader::new(stdout);
