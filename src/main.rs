@@ -313,10 +313,12 @@ fn spawn_agent() -> std::io::Result<std::process::Child> {
 }
 
 fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
-    if let Some(stdin) = agent.stdin.as_mut() {
+    if let Some(ref mut stdin) = agent.stdin {
         let _ = stdin.write_all(prompt.as_bytes());
         let _ = stdin.flush();
     }
+    // Close stdin so agent gets EOF
+    agent.stdin = None;
 }
 
 // ─── Blocking ─────────────────────────────────────────────────
