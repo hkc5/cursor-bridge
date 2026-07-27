@@ -186,13 +186,23 @@ fn respond_hello(mut s: TcpStream, head: bool) {
     let _ = s.write_all(h.as_bytes());
 }
 fn respond_models(mut s: TcpStream) {
-    let body = r#"{"data":[
-        {"type":"model","id":"cursor-auto","display_name":"Cursor Auto"},
-        {"type":"model","id":"cursor-smart","display_name":"Cursor Smart"},
-        {"type":"model","id":"default","display_name":"Default"}
-    ]}"#;
+    let body = get_models_json();
     let h = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
     let _ = s.write_all(h.as_bytes());
+}
+
+fn get_models_json() -> String {
+    r#"{"data":[
+        {"type":"model","id":"default","display_name":"Auto"},
+        {"type":"model","id":"claude-sonnet-4-6-high","display_name":"Claude Sonnet 4.6 High"},
+        {"type":"model","id":"claude-sonnet-4-6-high-fast","display_name":"Claude Sonnet 4.6 High Fast"},
+        {"type":"model","id":"claude-opus-5-high","display_name":"Claude Opus 5 High"},
+        {"type":"model","id":"claude-opus-5-high-fast","display_name":"Claude Opus 5 High Fast"},
+        {"type":"model","id":"cursor-grok-4.5-high","display_name":"Cursor Grok 4.5"},
+        {"type":"model","id":"cursor-grok-4.5-high-fast","display_name":"Cursor Grok 4.5 Fast"},
+        {"type":"model","id":"composer-2.5","display_name":"Composer 2.5"},
+        {"type":"model","id":"composer-2.5-fast","display_name":"Composer 2.5 Fast"}
+    ]}"#.to_string()
 }
 
 // ─── Messages ─────────────────────────────────────────────────
@@ -307,7 +317,7 @@ fn find_agent() -> Option<String> {
     None
 }
 
-fn spawn_agent() -> std::io::Result<std::process::Child> {
+fn spawn_agent(requested_model: &str) -> std::io::Result<std::process::Child> {
     let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
     log(&format!("spawning: {path}"));
 
@@ -320,7 +330,7 @@ fn spawn_agent() -> std::io::Result<std::process::Child> {
     // --force auto-approves tool calls in non-interactive mode.
     // --trust skips workspace trust prompt.
     Command::new(path)
-        .args(["--print", "--force", "--output-format", "stream-json", "--model", "auto", "--trust"])
+        .args(["--print", "--force", "--output-format", "stream-json", "--model", requested_model, "--trust"])
         .current_dir(&sandbox)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -343,7 +353,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let prompt = build_prompt(req.messages.as_deref().unwrap_or_default(), &req.system);
     let model = req.model.as_deref().unwrap_or("cursor-auto");
 
-    let mut agent = match spawn_agent() { Ok(a) => a, Err(e) => {
+    let mut agent = match spawn_agent(model) { Ok(a) => a, Err(e) => {
         let err = format!("{{\"error\":\"agent: {e}\"}}");
         let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
         return;
@@ -395,7 +405,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let prompt = build_prompt(req.messages.as_deref().unwrap_or_default(), &req.system);
     let model = req.model.as_deref().unwrap_or("cursor-auto");
 
-    let mut agent = match spawn_agent() { Ok(a) => a, Err(e) => {
+    let mut agent = match spawn_agent(model) { Ok(a) => a, Err(e) => {
         let err = format!("{{\"error\":\"agent: {e}\"}}");
         let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
         return;
