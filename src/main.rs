@@ -317,22 +317,9 @@ fn find_agent() -> Option<String> {
     None
 }
 
-/// Collapses the agent's text events into the reply the user should see.
-///
-/// With `--stream-partial-output` the agent streams incremental text events
-/// and then closes each *segment* — the run of text before a tool call, or
-/// before the end of the turn — with a recap event repeating everything that
-/// segment already sent. Forwarding the recap shows that passage twice.
-///
-/// A recap cannot be recognised on arrival: it looks exactly like any other
-/// text event, and `timestamp_ms` does not separate them (only the very last
-/// recap of a turn is untagged, the mid-turn ones are tagged like deltas).
-/// What identifies it is that it closes a segment and repeats it verbatim, so
-/// the most recent event is held back until the segment ends and only then
-/// compared against what was streamed.
-///
-/// An agent too old to know the flag sends one untagged event and no deltas;
-/// it compares unequal to an empty segment and is emitted normally.
+/// With --stream-partial-output the agent ends each text segment (before a tool
+/// call or the result) with a recap repeating it; hold the last event back and
+/// drop it if it equals the segment.
 struct TextStream {
     segment: String,
     pending: Option<String>,
@@ -341,15 +328,12 @@ struct TextStream {
 impl TextStream {
     fn new() -> Self { Self { segment: String::new(), pending: None } }
 
-    /// Takes the next text event. Returns whatever is now safe to emit.
     fn push(&mut self, text: &str) -> Option<String> {
         let ready = self.pending.replace(text.to_string());
         if let Some(ref t) = ready { self.segment.push_str(t); }
         ready
     }
 
-    /// Closes the segment at a tool call or at the end of the turn. Returns
-    /// the held-back event unless it was this segment's recap.
     fn flush(&mut self) -> Option<String> {
         let last = self.pending.take();
         let ready = match last {
@@ -423,7 +407,6 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
                     }
                 }
             }
-            // A tool call closes the current run of text, as does the result.
             if event["type"] == "tool_call" || event["type"] == "result" {
                 if let Some(out) = texts.flush() { text.push_str(&out); }
             }
@@ -454,9 +437,7 @@ fn write_sse(stream: &mut TcpStream, event_type: &str, data: &serde_json::Value)
     stream.flush()
 }
 
-/// Appends text to the open block, opening one first if needed. Anthropic
-/// clients accumulate `content_block_start.text` plus every delta, so the
-/// start must be empty and only deltas may carry content.
+// Block start must carry empty text; clients append deltas to it.
 fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bool) {
     if text.is_empty() { return; }
     if !*block_open {
@@ -497,7 +478,6 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut content_index = 0i32;
     let mut result_received = false;
-    // A run of text deltas belongs in one content block, not one block each.
     let mut text_block_open = false;
     let mut texts = TextStream::new();
 
@@ -514,15 +494,12 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                                 "text" => {
                                     if let Some(text) = block["text"].as_str() {
                                         if text.is_empty() { continue; }
-                                        // TextStream holds one event back so a
-                                        // segment recap can be recognised and dropped.
                                         if let Some(out) = texts.push(text) {
                                             emit_text(&mut stream, &out, content_index, &mut text_block_open);
                                         }
                                     }
                                 }
                                 "tool_use" => {
-                                    // A tool block cannot open while text is still streaming.
                                     if let Some(out) = texts.flush() {
                                         emit_text(&mut stream, &out, content_index, &mut text_block_open);
                                     }
@@ -627,7 +604,6 @@ fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
 mod tests {
     use super::*;
 
-    /// Feeds a segment's events and returns the text a client would render.
     fn render(segments: &[&[&str]]) -> String {
         let mut ts = TextStream::new();
         let mut out = String::new();
@@ -650,8 +626,7 @@ mod tests {
 
     #[test]
     fn test_recap_dropped_in_every_segment_of_a_tool_turn() {
-        // Text, tool call, more text: each segment ends with its own recap,
-        // and the mid-turn recap is tagged exactly like a delta.
+        // Each segment of a tool turn ends with its own recap.
         let out = render(&[
             &["I", "'ll check.", "I'll check."],
             &["The", " answer is 4.", "The answer is 4."],
@@ -667,8 +642,7 @@ mod tests {
 
     #[test]
     fn test_repeated_text_is_not_mistaken_for_a_recap() {
-        // "hi" twice mid-segment is real output, not a recap: only the event
-        // that closes the segment is eligible to be dropped.
+        // Only the event closing a segment can be a recap.
         assert_eq!(render(&[&["hi", "hi", "hihi"]]), "hihi");
     }
 
