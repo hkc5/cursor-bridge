@@ -1,11 +1,14 @@
 // cursor-bridge — Claude Code on Cursor's backend.
 // One binary. Zero config.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 fn log(msg: &str) {
@@ -223,6 +226,157 @@ struct Message {
     content: serde_json::Value,
 }
 
+// ─── Sessions ─────────────────────────────────────────────────
+
+// Claude Code resends the whole transcript every turn. Instead of replaying it
+// into a new agent, resume the Cursor chat (`--resume`) and send only what is
+// new. Conversations are keyed on their first turn and verified by a prefix
+// hash; any mismatch falls back to a fresh session.
+
+struct SessionEntry {
+    chat_id: String,
+    /// Turns of the next request the session already knows (incl. its last reply).
+    consumed: usize,
+    /// Prefix length and hash as of the last request served.
+    verify_len: usize,
+    verify_hash: u64,
+    model: String,
+}
+
+fn sessions() -> &'static Mutex<HashMap<u64, SessionEntry>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<u64, SessionEntry>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// User/assistant turns only, reminders stripped: Claude Code's interleaved
+/// `system` messages and `<system-reminder>` blocks are not stable across turns.
+struct Turn {
+    raw_index: usize,
+    role: String,
+    text: String,
+}
+
+fn conversation(messages: &[Message]) -> Vec<Turn> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user" || m.role == "assistant")
+        .map(|(raw_index, m)| Turn {
+            raw_index,
+            role: m.role.clone(),
+            text: strip_reminders(&extract_text(&m.content)),
+        })
+        .collect()
+}
+
+fn strip_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        rest = match rest[start..].find(CLOSE) {
+            Some(end) => &rest[start + end + CLOSE.len()..],
+            // Unterminated: drop the rest.
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+fn conversation_key(turns: &[Turn]) -> u64 {
+    prefix_hash(turns, 1)
+}
+
+/// Hashes position and role of each turn, plus text for non-assistant turns.
+/// Assistant text is skipped: the client's echo never matches what was streamed.
+fn prefix_hash(turns: &[Turn], upto: usize) -> u64 {
+    let mut h = DefaultHasher::new();
+    for (i, turn) in turns.iter().take(upto).enumerate() {
+        i.hash(&mut h);
+        turn.role.hash(&mut h);
+        if turn.role != "assistant" { turn.text.hash(&mut h); }
+    }
+    h.finish()
+}
+
+enum TurnPlan {
+    Fresh { prompt: String },
+    Resume { chat_id: String, prompt: String },
+}
+
+fn resume_disabled() -> bool {
+    std::env::var("CURSOR_BRIDGE_NO_RESUME").map_or(false, |v| !v.is_empty() && v != "0")
+}
+
+fn plan_turn(
+    store: &HashMap<u64, SessionEntry>,
+    messages: &[Message],
+    system: &Option<serde_json::Value>,
+    model: &str,
+) -> TurnPlan {
+    let fresh = || TurnPlan::Fresh { prompt: build_prompt(messages, system) };
+    let turns = conversation(messages);
+    if turns.is_empty() || resume_disabled() { return fresh(); }
+
+    let key = conversation_key(&turns);
+    let entry = match store.get(&key) {
+        Some(e) => e,
+        None => {
+            log(&format!("no session for key {key:x} ({} known, {} turns)", store.len(), turns.len()));
+            return fresh();
+        }
+    };
+    let reason = if entry.model != model {
+        "model changed"
+    } else if entry.consumed >= turns.len() {
+        "nothing new to send"
+    } else if entry.verify_len > turns.len() {
+        "history shorter than what we served"
+    } else if prefix_hash(&turns, entry.verify_len) != entry.verify_hash {
+        "prefix changed"
+    } else { "" };
+    if !reason.is_empty() {
+        log(&format!("fresh session ({reason}); consumed={} verify_len={} turns={}",
+                     entry.consumed, entry.verify_len, turns.len()));
+        return fresh();
+    }
+
+    // Forward raw messages after the last consumed turn so interleaved context still travels.
+    let start = turns[entry.consumed - 1].raw_index + 1;
+    TurnPlan::Resume {
+        chat_id: entry.chat_id.clone(),
+        prompt: build_prompt(&messages[start..], &None),
+    }
+}
+
+fn commit_session(
+    store: &mut HashMap<u64, SessionEntry>,
+    messages: &[Message],
+    model: &str,
+    chat_id: &str,
+) {
+    let turns = conversation(messages);
+    if turns.is_empty() || chat_id.is_empty() {
+        log(&format!("not recording session (chat_id {chat_id:?}, {} turns)", turns.len()));
+        return;
+    }
+    if store.len() >= 128 { store.clear(); }
+    let verify_len = turns.len();
+    let key = conversation_key(&turns);
+    log(&format!("recording session {chat_id} key {key:x} after {verify_len} turns"));
+    store.insert(key, SessionEntry {
+        chat_id: chat_id.to_string(),
+        // +1 for the reply this turn produced.
+        consumed: verify_len + 1,
+        verify_len,
+        verify_hash: prefix_hash(&turns, verify_len),
+        model: model.to_string(),
+    });
+}
+
 // ─── Prompt building ──────────────────────────────────────────
 
 fn extract_text(value: &serde_json::Value) -> String {
@@ -345,7 +499,7 @@ impl TextStream {
     }
 }
 
-fn spawn_agent(requested_model: &str) -> std::io::Result<std::process::Child> {
+fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<std::process::Child> {
     let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
     log(&format!("spawning: {path}"));
 
@@ -357,10 +511,14 @@ fn spawn_agent(requested_model: &str) -> std::io::Result<std::process::Child> {
     // Default mode (no --mode) = full agent with tool execution.
     // --force auto-approves tool calls in non-interactive mode.
     // --trust skips workspace trust prompt.
-    Command::new(path)
-        .args(["--print", "--force", "--output-format", "stream-json", "--stream-partial-output",
-               "--model", requested_model, "--trust"])
-        .current_dir(&sandbox)
+    let mut cmd = Command::new(path);
+    cmd.args(["--print", "--force", "--output-format", "stream-json", "--stream-partial-output",
+              "--model", requested_model, "--trust"]);
+    if let Some(chat_id) = resume {
+        log(&format!("resuming session {chat_id}"));
+        cmd.args(["--resume", chat_id]);
+    }
+    cmd.current_dir(&sandbox)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -379,10 +537,14 @@ fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
 // ─── Blocking ─────────────────────────────────────────────────
 
 fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
-    let prompt = build_prompt(req.messages.as_deref().unwrap_or_default(), &req.system);
+    let messages = req.messages.as_deref().unwrap_or_default();
     let model = req.model.as_deref().unwrap_or("cursor-auto");
+    let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
+        TurnPlan::Fresh { prompt } => (None, prompt),
+        TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
+    };
 
-    let mut agent = match spawn_agent(model) { Ok(a) => a, Err(e) => {
+    let mut agent = match spawn_agent(model, resume.as_deref()) { Ok(a) => a, Err(e) => {
         let err = format!("{{\"error\":\"agent: {e}\"}}");
         let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
         return;
@@ -393,6 +555,8 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let mut text = String::new();
     let mut texts = TextStream::new();
     let mut usage = serde_json::json!({});
+    let mut chat_id = String::new();
+    let mut succeeded = false;
 
     for line in reader.lines() {
         let line = match line { Ok(l) => l, _ => break };
@@ -410,11 +574,21 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
             if event["type"] == "tool_call" || event["type"] == "result" {
                 if let Some(out) = texts.flush() { text.push_str(&out); }
             }
-            if event["type"] == "result" { usage = event["usage"].clone(); }
+            if event["type"] == "system" && event["subtype"] == "init" {
+                if let Some(id) = event["session_id"].as_str() { chat_id = id.to_string(); }
+            }
+            if event["type"] == "result" {
+                usage = event["usage"].clone();
+                succeeded = event["is_error"] != serde_json::Value::Bool(true);
+            }
         }
     }
     let _ = agent.wait();
     if let Some(out) = texts.flush() { text.push_str(&out); }
+
+    if succeeded {
+        commit_session(&mut sessions().lock().unwrap(), messages, model, &chat_id);
+    }
 
     let resp = serde_json::json!({
         "id": format!("msg_{}", std::process::id()), "type": "message", "role": "assistant",
@@ -454,10 +628,14 @@ fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bo
 }
 
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
-    let prompt = build_prompt(req.messages.as_deref().unwrap_or_default(), &req.system);
+    let messages = req.messages.as_deref().unwrap_or_default();
     let model = req.model.as_deref().unwrap_or("cursor-auto");
+    let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
+        TurnPlan::Fresh { prompt } => (None, prompt),
+        TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
+    };
 
-    let mut agent = match spawn_agent(model) { Ok(a) => a, Err(e) => {
+    let mut agent = match spawn_agent(model, resume.as_deref()) { Ok(a) => a, Err(e) => {
         let err = format!("{{\"error\":\"agent: {e}\"}}");
         let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
         return;
@@ -478,6 +656,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut content_index = 0i32;
     let mut result_received = false;
+    let mut chat_id = String::new();
     let mut text_block_open = false;
     let mut texts = TextStream::new();
 
@@ -528,6 +707,9 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                         }
                     }
                 }
+                Some("system") if event["subtype"] == "init" => {
+                    if let Some(id) = event["session_id"].as_str() { chat_id = id.to_string(); }
+                }
                 Some("tool_call") => {
                     if let Some(out) = texts.flush() {
                         emit_text(&mut stream, &out, content_index, &mut text_block_open);
@@ -543,6 +725,9 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                             "type": "content_block_stop", "index": content_index
                         }));
                         text_block_open = false;
+                    }
+                    if event["is_error"] != serde_json::Value::Bool(true) {
+                        commit_session(&mut sessions().lock().unwrap(), messages, model, &chat_id);
                     }
                     let usage = &event["usage"];
                     let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
@@ -603,6 +788,152 @@ fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg(role: &str, text: &str) -> Message {
+        Message { role: role.into(), content: serde_json::Value::String(text.into()) }
+    }
+
+    fn serve(store: &mut HashMap<u64, SessionEntry>, msgs: &[Message], model: &str) -> TurnPlan {
+        let plan = plan_turn(store, msgs, &None, model);
+        commit_session(store, msgs, model, "chat-1");
+        plan
+    }
+
+    #[test]
+    fn test_reminders_are_stripped_from_identity() {
+        assert_eq!(strip_reminders("<system-reminder>noise</system-reminder>\n\nhello"), "hello");
+        assert_eq!(strip_reminders("a<system-reminder>x</system-reminder>b"), "ab");
+        assert_eq!(strip_reminders("plain"), "plain");
+        assert_eq!(strip_reminders("keep<system-reminder>dangling"), "keep");
+    }
+
+    #[test]
+    fn test_interleaved_system_messages_are_not_part_of_the_conversation() {
+        let msgs = vec![
+            msg("user", "<system-reminder>varies</system-reminder>\n\nhello"),
+            msg("system", "hook output, 24kb of it"),
+            msg("assistant", "hi"),
+            msg("user", "again"),
+        ];
+        let turns = conversation(&msgs);
+        assert_eq!(turns.len(), 3, "system messages are not turns");
+        assert_eq!(turns[0].text, "hello", "reminders are stripped");
+        assert_eq!(turns[2].raw_index, 3, "raw positions are preserved");
+    }
+
+    // System messages and reminders shift between requests.
+    #[test]
+    fn test_session_survives_client_reinjected_context() {
+        let mut store = HashMap::new();
+        let turn1 = vec![
+            msg("user", "<system-reminder>turn one</system-reminder>\n\nRemember 7."),
+            msg("system", "hook context, ends with a newline\n"),
+        ];
+        serve(&mut store, &turn1, "sonnet-4.5");
+
+        let turn2 = vec![
+            msg("user", "<system-reminder>turn two, different</system-reminder>\n\nRemember 7."),
+            msg("system", "hook context, ends with a newline"),
+            msg("assistant", "OK"),
+            msg("user", "What number?"),
+            msg("system", "<total_tokens>14999</total_tokens>"),
+        ];
+        match plan_turn(&store, &turn2, &None, "sonnet-4.5") {
+            TurnPlan::Resume { prompt, .. } => {
+                assert!(prompt.contains("What number?"), "the new question is sent");
+                assert!(!prompt.contains("Remember 7."), "history stays in the session");
+                assert!(prompt.contains("14999"), "context after the new turn still travels");
+            }
+            TurnPlan::Fresh { .. } => panic!("re-injected context must not defeat the session"),
+        }
+    }
+
+    #[test]
+    fn test_second_turn_resumes_and_sends_only_the_new_message() {
+        let mut store = HashMap::new();
+        serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
+
+        let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
+        match plan_turn(&store, &turn2, &None, "sonnet-4.5") {
+            TurnPlan::Resume { chat_id, prompt } => {
+                assert_eq!(chat_id, "chat-1");
+                assert!(prompt.contains("u2"), "new message must be sent");
+                assert!(!prompt.contains("u1"), "history is already in the session");
+                assert!(!prompt.contains("a1"), "the reply is already in the session");
+            }
+            TurnPlan::Fresh { .. } => panic!("second turn should resume"),
+        }
+    }
+
+    #[test]
+    fn test_third_turn_keeps_sending_only_the_new_message() {
+        let mut store = HashMap::new();
+        serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
+        let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
+        serve(&mut store, &turn2, "sonnet-4.5");
+
+        let turn3 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2"),
+                         msg("assistant", "a2"), msg("user", "u3")];
+        match plan_turn(&store, &turn3, &None, "sonnet-4.5") {
+            TurnPlan::Resume { prompt, .. } => {
+                assert!(prompt.contains("u3"));
+                assert!(!prompt.contains("u2"), "u2 was consumed by the previous turn");
+            }
+            TurnPlan::Fresh { .. } => panic!("third turn should resume"),
+        }
+    }
+
+    #[test]
+    fn test_edited_user_message_falls_back_to_a_fresh_session() {
+        let mut store = HashMap::new();
+        serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
+        let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
+        serve(&mut store, &turn2, "sonnet-4.5");
+
+        let forked = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "EDITED"),
+                          msg("assistant", "a2"), msg("user", "u3")];
+        match plan_turn(&store, &forked, &None, "sonnet-4.5") {
+            TurnPlan::Fresh { prompt } => assert!(prompt.contains("u1"), "full history is replayed"),
+            TurnPlan::Resume { .. } => panic!("a rewritten prefix must not reuse the session"),
+        }
+    }
+
+    #[test]
+    fn test_dropped_message_falls_back_to_a_fresh_session() {
+        let mut store = HashMap::new();
+        serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
+        let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
+        serve(&mut store, &turn2, "sonnet-4.5");
+
+        let compacted = vec![msg("user", "u1"), msg("user", "u2"), msg("assistant", "a2"),
+                             msg("user", "u3")];
+        match plan_turn(&store, &compacted, &None, "sonnet-4.5") {
+            TurnPlan::Fresh { .. } => {}
+            TurnPlan::Resume { .. } => panic!("a reordered prefix must not reuse the session"),
+        }
+    }
+
+    #[test]
+    fn test_switching_model_starts_a_fresh_session() {
+        let mut store = HashMap::new();
+        serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
+        let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
+        match plan_turn(&store, &turn2, &None, "gpt-5") {
+            TurnPlan::Fresh { .. } => {}
+            TurnPlan::Resume { .. } => panic!("a different model needs its own session"),
+        }
+    }
+
+    #[test]
+    fn test_a_replayed_turn_does_not_resume() {
+        let mut store = HashMap::new();
+        let turn1 = vec![msg("user", "u1")];
+        serve(&mut store, &turn1, "sonnet-4.5");
+        match plan_turn(&store, &turn1, &None, "sonnet-4.5") {
+            TurnPlan::Fresh { .. } => {}
+            TurnPlan::Resume { .. } => panic!("no unseen messages means no resume"),
+        }
+    }
 
     fn render(segments: &[&[&str]]) -> String {
         let mut ts = TextStream::new();
