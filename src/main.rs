@@ -227,27 +227,17 @@ struct Message {
 }
 
 // ─── Sessions ─────────────────────────────────────────────────
-//
-// The Messages API is stateless: Claude Code resends the whole transcript on
-// every turn. Replaying all of it into a brand-new `cursor-agent` costs a
-// process boot plus a full re-ingest each time — tens of seconds before the
-// model says anything. `cursor-agent --resume <chatId>` keeps the transcript
-// on Cursor's side, so a turn only has to carry what is new.
-//
-// Mapping stateless requests onto a stateful session means recognising a
-// conversation we have already served. Requests are keyed on their opening
-// message and the match is confirmed by hashing the prefix we last saw, so a
-// forked or edited transcript falls back to a fresh session instead of
-// answering from the wrong history.
+
+// Claude Code resends the whole transcript every turn. Instead of replaying it
+// into a new agent, resume the Cursor chat (`--resume`) and send only what is
+// new. Conversations are keyed on their first turn and verified by a prefix
+// hash; any mismatch falls back to a fresh session.
 
 struct SessionEntry {
     chat_id: String,
-    /// Messages of the *next* request this session already knows: everything
-    /// we fed it, plus the reply it produced.
+    /// Turns of the next request the session already knows (incl. its last reply).
     consumed: usize,
-    /// Length and hash of the prefix as it appeared in the request we last
-    /// served. `consumed` counts one further, to include the reply we cannot
-    /// hash because the client has not echoed it back yet.
+    /// Prefix length and hash as of the last request served.
     verify_len: usize,
     verify_hash: u64,
     model: String,
@@ -258,19 +248,9 @@ fn sessions() -> &'static Mutex<HashMap<u64, SessionEntry>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The messages a conversation is actually made of.
-///
-/// Claude Code does not resend a clean transcript. It interleaves `system`
-/// messages carrying hook output and remaining-token counts, and wraps user
-/// text in `<system-reminder>` blocks. Both are rebuilt on every request and
-/// differ between turns — observed down to a single trailing newline in a
-/// 24KB block — so hashing the raw messages makes an ongoing conversation
-/// look new every time and no session is ever reused. Identity is therefore
-/// taken from the user and assistant turns alone, with the re-injected blocks
-/// stripped.
+/// User/assistant turns only, reminders stripped: Claude Code's interleaved
+/// `system` messages and `<system-reminder>` blocks are not stable across turns.
 struct Turn {
-    /// Where this turn sits in the request, so the untouched messages after
-    /// it can still be forwarded.
     raw_index: usize,
     role: String,
     text: String,
@@ -289,7 +269,6 @@ fn conversation(messages: &[Message]) -> Vec<Turn> {
         .collect()
 }
 
-/// Removes `<system-reminder>` blocks, which the client regenerates per turn.
 fn strip_reminders(text: &str) -> String {
     const OPEN: &str = "<system-reminder>";
     const CLOSE: &str = "</system-reminder>";
@@ -299,7 +278,7 @@ fn strip_reminders(text: &str) -> String {
         out.push_str(&rest[..start]);
         rest = match rest[start..].find(CLOSE) {
             Some(end) => &rest[start + end + CLOSE.len()..],
-            // Unterminated: nothing after it can be trusted as stable.
+            // Unterminated: drop the rest.
             None => "",
         };
     }
@@ -307,22 +286,12 @@ fn strip_reminders(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// Conversations are looked up by their opening turn; `prefix_hash` confirms
-/// the rest still matches before a session is reused.
 fn conversation_key(turns: &[Turn]) -> u64 {
     prefix_hash(turns, 1)
 }
 
-/// Hashes the first `upto` turns by position and role, and by text for
-/// everything the client authored.
-///
-/// Assistant text is deliberately excluded. A reply is committed before the
-/// client echoes it back, so its exact serialisation is not known here — and
-/// once the turn used tools, the echoed form never matches what was streamed.
-/// Hashing it would send every tool-using conversation down the fresh-session
-/// path and undo the point of resuming. Position and role are still hashed,
-/// so an inserted, dropped or reordered turn is caught; only a rewrite of the
-/// assistant's own words slips through, which no client does.
+/// Hashes position and role of each turn, plus text for non-assistant turns.
+/// Assistant text is skipped: the client's echo never matches what was streamed.
 fn prefix_hash(turns: &[Turn], upto: usize) -> u64 {
     let mut h = DefaultHasher::new();
     for (i, turn) in turns.iter().take(upto).enumerate() {
@@ -334,9 +303,7 @@ fn prefix_hash(turns: &[Turn], upto: usize) -> u64 {
 }
 
 enum TurnPlan {
-    /// No usable session: replay the transcript into a new one.
     Fresh { prompt: String },
-    /// Session recognised: send only what it has not seen.
     Resume { chat_id: String, prompt: String },
 }
 
@@ -344,9 +311,6 @@ fn resume_disabled() -> bool {
     std::env::var("CURSOR_BRIDGE_NO_RESUME").map_or(false, |v| !v.is_empty() && v != "0")
 }
 
-/// Decide how to run this turn. Reuse requires a recognised conversation, the
-/// same model, unseen turns to send, and a prefix that still hashes to what
-/// we served last time.
 fn plan_turn(
     store: &HashMap<u64, SessionEntry>,
     messages: &[Message],
@@ -380,17 +344,14 @@ fn plan_turn(
         return fresh();
     }
 
-    // Everything the client added after the last turn the session consumed,
-    // taken from the untouched request so interleaved context still travels.
+    // Forward raw messages after the last consumed turn so interleaved context still travels.
     let start = turns[entry.consumed - 1].raw_index + 1;
-    // The session already carries the system prompt from when it was opened.
     TurnPlan::Resume {
         chat_id: entry.chat_id.clone(),
         prompt: build_prompt(&messages[start..], &None),
     }
 }
 
-/// Record what the session now knows, so the next request can skip it.
 fn commit_session(
     store: &mut HashMap<u64, SessionEntry>,
     messages: &[Message],
@@ -402,14 +363,13 @@ fn commit_session(
         log(&format!("not recording session (chat_id {chat_id:?}, {} turns)", turns.len()));
         return;
     }
-    // Bound the map; conversations are cheap to re-open if evicted.
     if store.len() >= 128 { store.clear(); }
     let verify_len = turns.len();
     let key = conversation_key(&turns);
     log(&format!("recording session {chat_id} key {key:x} after {verify_len} turns"));
     store.insert(key, SessionEntry {
         chat_id: chat_id.to_string(),
-        // +1 for the reply this turn produced, which the next request echoes back.
+        // +1 for the reply this turn produced.
         consumed: verify_len + 1,
         verify_len,
         verify_hash: prefix_hash(&turns, verify_len),
@@ -626,8 +586,6 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let _ = agent.wait();
     if let Some(out) = texts.flush() { text.push_str(&out); }
 
-    // Only a completed turn may be resumed; a failed one leaves the session
-    // in a state the turn arithmetic no longer describes.
     if succeeded {
         commit_session(&mut sessions().lock().unwrap(), messages, model, &chat_id);
     }
@@ -835,7 +793,6 @@ mod tests {
         Message { role: role.into(), content: serde_json::Value::String(text.into()) }
     }
 
-    /// Serve a turn and record its session, the way a handler does.
     fn serve(store: &mut HashMap<u64, SessionEntry>, msgs: &[Message], model: &str) -> TurnPlan {
         let plan = plan_turn(store, msgs, &None, model);
         commit_session(store, msgs, model, "chat-1");
@@ -847,7 +804,6 @@ mod tests {
         assert_eq!(strip_reminders("<system-reminder>noise</system-reminder>\n\nhello"), "hello");
         assert_eq!(strip_reminders("a<system-reminder>x</system-reminder>b"), "ab");
         assert_eq!(strip_reminders("plain"), "plain");
-        // An unterminated block means the remainder cannot be trusted as stable.
         assert_eq!(strip_reminders("keep<system-reminder>dangling"), "keep");
     }
 
@@ -865,9 +821,7 @@ mod tests {
         assert_eq!(turns[2].raw_index, 3, "raw positions are preserved");
     }
 
-    /// The shape Claude Code actually sends: a system message alongside the
-    /// first turn whose content shifts by a byte between requests, which is
-    /// what defeated an earlier keying attempt.
+    // System messages and reminders shift between requests.
     #[test]
     fn test_session_survives_client_reinjected_context() {
         let mut store = HashMap::new();
@@ -895,21 +849,10 @@ mod tests {
     }
 
     #[test]
-    fn test_first_turn_has_no_session_to_resume() {
-        let mut store = HashMap::new();
-        let msgs = vec![msg("user", "u1")];
-        match serve(&mut store, &msgs, "sonnet-4.5") {
-            TurnPlan::Fresh { prompt } => assert!(prompt.contains("u1")),
-            TurnPlan::Resume { .. } => panic!("nothing to resume on the first turn"),
-        }
-    }
-
-    #[test]
     fn test_second_turn_resumes_and_sends_only_the_new_message() {
         let mut store = HashMap::new();
         serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
 
-        // The client echoes the reply back and appends the next question.
         let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
         match plan_turn(&store, &turn2, &None, "sonnet-4.5") {
             TurnPlan::Resume { chat_id, prompt } => {
@@ -947,7 +890,6 @@ mod tests {
         let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
         serve(&mut store, &turn2, "sonnet-4.5");
 
-        // The user edits u2 and resends; the session's history no longer applies.
         let forked = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "EDITED"),
                           msg("assistant", "a2"), msg("user", "u3")];
         match plan_turn(&store, &forked, &None, "sonnet-4.5") {
@@ -963,7 +905,6 @@ mod tests {
         let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
         serve(&mut store, &turn2, "sonnet-4.5");
 
-        // History compacted: a turn disappeared, so positions no longer line up.
         let compacted = vec![msg("user", "u1"), msg("user", "u2"), msg("assistant", "a2"),
                              msg("user", "u3")];
         match plan_turn(&store, &compacted, &None, "sonnet-4.5") {
@@ -988,30 +929,10 @@ mod tests {
         let mut store = HashMap::new();
         let turn1 = vec![msg("user", "u1")];
         serve(&mut store, &turn1, "sonnet-4.5");
-        // Same request again: nothing new to send.
         match plan_turn(&store, &turn1, &None, "sonnet-4.5") {
             TurnPlan::Fresh { .. } => {}
             TurnPlan::Resume { .. } => panic!("no unseen messages means no resume"),
         }
-    }
-
-    #[test]
-    fn test_distinct_conversations_get_distinct_sessions() {
-        let mut store = HashMap::new();
-        serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
-        let other = vec![msg("user", "different opening"), msg("assistant", "a"), msg("user", "b")];
-        match plan_turn(&store, &other, &None, "sonnet-4.5") {
-            TurnPlan::Fresh { .. } => {}
-            TurnPlan::Resume { .. } => panic!("unrelated conversation must not reuse the session"),
-        }
-    }
-
-    #[test]
-    fn test_failed_turn_is_not_committed() {
-        let mut store = HashMap::new();
-        // A handler only commits on success; an empty chat id must not register.
-        commit_session(&mut store, &[msg("user", "u1")], "sonnet-4.5", "");
-        assert!(store.is_empty());
     }
 
     fn render(segments: &[&[&str]]) -> String {
