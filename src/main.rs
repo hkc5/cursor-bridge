@@ -511,6 +511,34 @@ fn find_agent() -> Option<String> {
     None
 }
 
+/// With --stream-partial-output the agent ends each text segment (before a tool
+/// call or the result) with a recap repeating it; hold the last event back and
+/// drop it if it equals the segment.
+struct TextStream {
+    segment: String,
+    pending: Option<String>,
+}
+
+impl TextStream {
+    fn new() -> Self { Self { segment: String::new(), pending: None } }
+
+    fn push(&mut self, text: &str) -> Option<String> {
+        let ready = self.pending.replace(text.to_string());
+        if let Some(ref t) = ready { self.segment.push_str(t); }
+        ready
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        let last = self.pending.take();
+        let ready = match last {
+            Some(t) if t != self.segment => Some(t),
+            _ => None,
+        };
+        self.segment.clear();
+        ready
+    }
+}
+
 fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<std::process::Child> {
     let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
     log(&format!("spawning: {path}"));
@@ -524,7 +552,7 @@ fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<s
     // --force auto-approves tool calls in non-interactive mode.
     // --trust skips workspace trust prompt.
     let mut cmd = Command::new(path);
-    cmd.args(["--print", "--force", "--output-format", "stream-json",
+    cmd.args(["--print", "--force", "--output-format", "stream-json", "--stream-partial-output",
               "--model", requested_model, "--trust"]);
     if let Some(chat_id) = resume {
         log(&format!("resuming session {chat_id}"));
@@ -565,6 +593,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
 
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut text = String::new();
+    let mut texts = TextStream::new();
     let mut usage = serde_json::json!({});
     let mut chat_id = String::new();
     let mut succeeded = false;
@@ -576,9 +605,14 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
             if event["type"] == "assistant" {
                 if let Some(arr) = event["message"]["content"].as_array() {
                     for block in arr {
-                        if let Some(t) = block["text"].as_str() { text.push_str(t); }
+                        if let Some(t) = block["text"].as_str() {
+                            if let Some(out) = texts.push(t) { text.push_str(&out); }
+                        }
                     }
                 }
+            }
+            if event["type"] == "tool_call" || event["type"] == "result" {
+                if let Some(out) = texts.flush() { text.push_str(&out); }
             }
             if event["type"] == "system" && event["subtype"] == "init" {
                 if let Some(id) = event["session_id"].as_str() { chat_id = id.to_string(); }
@@ -590,6 +624,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
         }
     }
     let _ = agent.wait();
+    if let Some(out) = texts.flush() { text.push_str(&out); }
 
     // Only a completed turn may be resumed; a failed one leaves the session
     // in a state the turn arithmetic no longer describes.
@@ -616,6 +651,22 @@ fn write_sse(stream: &mut TcpStream, event_type: &str, data: &serde_json::Value)
     stream.write_all(json.as_bytes())?;
     stream.write_all(b"\n\n")?;
     stream.flush()
+}
+
+// Block start must carry empty text; clients append deltas to it.
+fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bool) {
+    if text.is_empty() { return; }
+    if !*block_open {
+        let _ = write_sse(stream, "content_block_start", &serde_json::json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "text", "text": ""}
+        }));
+        *block_open = true;
+    }
+    let _ = write_sse(stream, "content_block_delta", &serde_json::json!({
+        "type": "content_block_delta", "index": index,
+        "delta": {"type": "text_delta", "text": text}
+    }));
 }
 
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
@@ -648,6 +699,8 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let mut content_index = 0i32;
     let mut result_received = false;
     let mut chat_id = String::new();
+    let mut text_block_open = false;
+    let mut texts = TextStream::new();
 
     for line in reader.lines() {
         let line = match line { Ok(l) => l, _ => break };
@@ -661,21 +714,23 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                             match block_type {
                                 "text" => {
                                     if let Some(text) = block["text"].as_str() {
-                                        let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
-                                            "type": "content_block_start", "index": content_index,
-                                            "content_block": {"type": "text", "text": text}
-                                        }));
-                                        let _ = write_sse(&mut stream, "content_block_delta", &serde_json::json!({
-                                            "type": "content_block_delta", "index": content_index,
-                                            "delta": {"type": "text_delta", "text": text}
-                                        }));
-                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
-                                            "type": "content_block_stop", "index": content_index
-                                        }));
-                                        content_index += 1;
+                                        if text.is_empty() { continue; }
+                                        if let Some(out) = texts.push(text) {
+                                            emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                        }
                                     }
                                 }
                                 "tool_use" => {
+                                    if let Some(out) = texts.flush() {
+                                        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                    }
+                                    if text_block_open {
+                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                                            "type": "content_block_stop", "index": content_index
+                                        }));
+                                        text_block_open = false;
+                                        content_index += 1;
+                                    }
                                     let name = block["name"].as_str().unwrap_or("unknown");
                                     let input = block["input"].clone();
                                     let fallback_id = format!("toolu_{}", content_index);
@@ -697,8 +752,22 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                 Some("system") if event["subtype"] == "init" => {
                     if let Some(id) = event["session_id"].as_str() { chat_id = id.to_string(); }
                 }
+                Some("tool_call") => {
+                    if let Some(out) = texts.flush() {
+                        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                    }
+                }
                 Some("result") => {
                     result_received = true;
+                    if let Some(out) = texts.flush() {
+                        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                    }
+                    if text_block_open {
+                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                            "type": "content_block_stop", "index": content_index
+                        }));
+                        text_block_open = false;
+                    }
                     if event["is_error"] != serde_json::Value::Bool(true) {
                         commit_session(&mut sessions().lock().unwrap(), messages, model, &chat_id);
                     }
@@ -715,6 +784,15 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                 _ => {}
             }
         }
+    }
+
+    if let Some(out) = texts.flush() {
+        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+    }
+    if text_block_open {
+        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+            "type": "content_block_stop", "index": content_index
+        }));
     }
 
     if !result_received {
@@ -934,6 +1012,53 @@ mod tests {
         // A handler only commits on success; an empty chat id must not register.
         commit_session(&mut store, &[msg("user", "u1")], "sonnet-4.5", "");
         assert!(store.is_empty());
+    }
+
+    fn render(segments: &[&[&str]]) -> String {
+        let mut ts = TextStream::new();
+        let mut out = String::new();
+        for seg in segments {
+            for ev in *seg {
+                if let Some(t) = ts.push(ev) { out.push_str(&t); }
+            }
+            if let Some(t) = ts.flush() { out.push_str(&t); }
+        }
+        out
+    }
+
+    #[test]
+    fn test_segment_recap_is_dropped() {
+        // Deltas, then the recap repeating the whole segment.
+        let out = render(&[&["I", "'ll run that", " command", " for you.",
+                             "I'll run that command for you."]]);
+        assert_eq!(out, "I'll run that command for you.");
+    }
+
+    #[test]
+    fn test_recap_dropped_in_every_segment_of_a_tool_turn() {
+        // Each segment of a tool turn ends with its own recap.
+        let out = render(&[
+            &["I", "'ll check.", "I'll check."],
+            &["The", " answer is 4.", "The answer is 4."],
+        ]);
+        assert_eq!(out, "I'll check.The answer is 4.");
+    }
+
+    #[test]
+    fn test_single_event_without_deltas_is_emitted() {
+        // An agent predating --stream-partial-output sends only the recap.
+        assert_eq!(render(&[&["the whole reply"]]), "the whole reply");
+    }
+
+    #[test]
+    fn test_repeated_text_is_not_mistaken_for_a_recap() {
+        // Only the event closing a segment can be a recap.
+        assert_eq!(render(&[&["hi", "hi", "hihi"]]), "hihi");
+    }
+
+    #[test]
+    fn test_empty_turn_produces_nothing() {
+        assert_eq!(render(&[&[]]), "");
     }
 
     #[test]
